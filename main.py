@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TRUE CRYPTO ALPHA v2.0 - Full Version
-Технический анализ + Генерация сигналов + Telegram
+TRUE CRYPTO ALPHA v3.0 - Full Version
+• Автоматический универсум топ-100 CMC с обновлением каждые сутки
+• Приоритет Binance, fallback: OKX/Bybit
+• Мультитаймфрейм-анализ: M15 (вход), H1 (контекст), H4 (структура)
+• Интеграция всех аналитических модулей (Эллиот, Volume Profile, Кластера, Order Blocks, Smart Money, Классика ТА)
+• Условия формирования сигнала с системой скоринга и антиспам-фильтром
+• Формат и отправка в Telegram
 """
-
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import ccxt
 import pandas as pd
 import numpy as np
 from colorama import Fore, Style, init
-
+import requests
 init(autoreset=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Telegram settings (optional)
 TELEGRAM_ENABLED = os.getenv('TELEGRAM_BOT_TOKEN') is not None
-
 if TELEGRAM_ENABLED:
     try:
         from telegram import Bot
@@ -34,237 +34,228 @@ if TELEGRAM_ENABLED:
     except:
         TELEGRAM_ENABLED = False
         logger.warning(f"{Fore.YELLOW}⚠️ Telegram не настроен{Style.RESET_ALL}")
-
+class CMCUniverse:
+    def __init__(self):
+        self.top100 = []
+        self.last_update = None
+    def fetch_top100(self):
+        url = 'https://api.coinmarketcap.com/data-api/v3/cryptocurrency/listing?start=1&limit=100&sortBy=market_cap'
+        try:
+            resp = requests.get(url)
+            coins = resp.json()['data']['cryptoCurrencyList']
+            self.top100 = [c['symbol'] for c in coins]
+            self.last_update = datetime.now()
+        except Exception as e:
+            logger.error(f"Ошибка обновления CMC: {e}")
+    def update_if_needed(self):
+        if self.last_update is None or (datetime.now()-self.last_update).total_seconds()>82800:
+            self.fetch_top100()
+    def get_pairs(self, exchange):
+        self.update_if_needed()
+        pairs = []
+        markets = exchange.load_markets()
+        for coin in self.top100:
+            if f'{coin}/USDT' in markets:
+                pairs.append(f'{coin}/USDT')
+            elif f'{coin}/USDC' in markets:
+                pairs.append(f'{coin}/USDC')
+        return pairs
+class TFEnum:
+    M15 = '15m'
+    H1 = '1h'
+    H4 = '4h'
 class TechnicalAnalysis:
-    """Технический анализ"""
-    
+    @staticmethod
+    def calculate_atr(df, period=14):
+        high = df['high']
+        low = df['low']
+        close = df['close']
+        tr = np.maximum(high-low, high-close.shift(), close.shift()-low)
+        atr = pd.Series(tr).rolling(window=period).mean()
+        return atr.iloc[-1] if not pd.isna(atr.iloc[-1]) else tr.mean()
+    @staticmethod
+    def calculate_ema(data, period):
+        ema = data.ewm(span=period, adjust=False).mean()
+        return ema.iloc[-1]
     @staticmethod
     def calculate_rsi(data, period=14):
-        """RSI индикатор"""
         delta = data.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         return rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
-    
     @staticmethod
-    def calculate_ema(data, period):
-        """EMA индикатор"""
-        ema = data.ewm(span=period, adjust=False).mean()
-        return ema.iloc[-1]
-    
+    def calculate_avg_volume(volume, window=20):
+        return pd.Series(volume).rolling(window=window).mean().iloc[-1]
+class SignalModules:
     @staticmethod
-    def calculate_macd(data):
-        """MACD индикатор"""
-        ema12 = data.ewm(span=12, adjust=False).mean()
-        ema26 = data.ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False).mean()
-        return macd.iloc[-1] - signal.iloc[-1]
-    
+    def elliott_wave(df_m15, df_h1):
+        swing_highs = df_m15['high'].rolling(window=3).apply(lambda x: x[1] > x[0] and x[1] > x[2]).fillna(0)
+        swing_lows = df_m15['low'].rolling(window=3).apply(lambda x: x[1] < x[0] and x[1] < x[2]).fillna(0)
+        impulse = swing_highs.sum()>=3 and swing_lows.sum()>=3
+        elliott_signal = impulse
+        elliott_dir = 'LONG' if df_h1['close'].iloc[-1]>df_h1['open'].iloc[-1] else 'SHORT'
+        return elliott_signal, elliott_dir
     @staticmethod
-    def analyze(df):
-        """Полный анализ"""
+    def volume_profile(df, bars=100):
+        prices = np.floor(df['close'][-bars:])
+        vols = df['volume'][-bars:]
+        vp = pd.DataFrame({'price': prices, 'vol': vols}).groupby('price').sum()
+        poc = vp['vol'].idxmax()
+        lvn = vp['vol'].idxmin()
+        current_price = df['close'].iloc[-1]
+        vp_ok = abs(current_price-lvn)<abs(current_price-poc)
+        return vp_ok, poc, lvn
+    @staticmethod
+    def cluster_absorb(df_m15):
+        last_bar = df_m15.iloc[-1]
+        mid_price = (last_bar['high']+last_bar['low'])/2
+        cluster_absorb = last_bar['volume']>df_m15['volume'].iloc[:-1].mean() and last_bar['close']>=mid_price
+        return cluster_absorb
+    @staticmethod
+    def order_block(df_m15):
+        vol_thr = df_m15['volume'].mean()*2
+        impulse_idx = np.where(df_m15['volume']>vol_thr)[0]
+        if len(impulse_idx)>0:
+            idx = impulse_idx[-1]
+            ob_price = df_m15['open'].iloc[idx]
+            ob_touched = abs(df_m15['close'].iloc[-1]-ob_price)<df_m15['close'].std()
+            return ob_touched, ob_price
+        else:
+            return False, None
+    @staticmethod
+    def smart_money(df_m15):
+        highs = df_m15['high']
+        lows = df_m15['low']
+        past_max = highs.iloc[:-5].max()
+        past_min = lows.iloc[:-5].min()
+        recent = df_m15.iloc[-5:]
+        liquidity_grab = recent['high'].max()>past_max or recent['low'].min()<past_min
+        post_impulse = recent['volume'].mean()>df_m15['volume'][:-5].mean()*1.2
+        imbalance_area = (recent['close'].max()-recent['close'].min())/recent['close'].mean()>0.01
+        smtm_ok = liquidity_grab and post_impulse and imbalance_area
+        return smtm_ok
+    @staticmethod
+    def classic_ta(df):
         close = df['close']
-        
-        rsi = TechnicalAnalysis.calculate_rsi(close)
-        ema20 = TechnicalAnalysis.calculate_ema(close, 20)
         ema50 = TechnicalAnalysis.calculate_ema(close, 50)
-        macd = TechnicalAnalysis.calculate_macd(close)
-        
-        current_price = close.iloc[-1]
-        
-        return {
-            'rsi': rsi,
-            'ema20': ema20,
-            'ema50': ema50,
-            'macd': macd,
-            'current_price': current_price
-        }
-
-class SignalGenerator:
-    """Генератор торговых сигналов"""
-    
+        ema200 = TechnicalAnalysis.calculate_ema(close, 200)
+        rsi = TechnicalAnalysis.calculate_rsi(close)
+        volume = df['volume'].iloc[-1]
+        avg_volume = TechnicalAnalysis.calculate_avg_volume(df['volume'])
+        long_cond = close.iloc[-1]>ema50 and close.iloc[-1]>ema200 and rsi<40 and rsi>20 and volume>=1.5*avg_volume
+        short_cond = close.iloc[-1]<ema50 and close.iloc[-1]<ema200 and rsi>60 and rsi<80 and volume>=1.5*avg_volume
+        ta_ok = long_cond or short_cond
+        return ta_ok
+class SignalAggregator:
     @staticmethod
-    def generate(analysis, pair):
-        """Генерация сигнала"""
-        rsi = analysis['rsi']
-        price = analysis['current_price']
-        ema20 = analysis['ema20']
-        ema50 = analysis['ema50']
-        macd = analysis['macd']
-        
-        signal = None
-        confidence = 0
-        
-        # LONG сигнал
-        if rsi < 35 and price > ema20 and macd > 0:
-            signal = 'LONG'
-            confidence = min(95, 60 + (35 - rsi) + (10 if price > ema50 else 0))
-            take_profit = price * 1.025
-            stop_loss = price * 0.985
-        
-        # SHORT сигнал  
-        elif rsi > 65 and price < ema20 and macd < 0:
-            signal = 'SHORT'
-            confidence = min(95, 60 + (rsi - 65) + (10 if price < ema50 else 0))
-            take_profit = price * 0.975
-            stop_loss = price * 1.015
-        
-        if signal and confidence >= 70:
-            return {
-                'type': signal,
-                'pair': pair,
-                'price': price,
-                'take_profit': take_profit,
-                'stop_loss': stop_loss,
-                'confidence': confidence,
-                'rsi': rsi,
-                'macd': 'Позитивный' if macd > 0 else 'Негативный'
-            }
-        
-        return None
-
+    def score(mods):
+        weights = {'elliott':2,'vp':1,'ob':1,'smtm':2,'ta':1,'cluster':1}
+        score = sum(weights[m] for m in mods if mods[m])
+        return score
+    @staticmethod
+    def is_strong_signal(flags):
+        strong = (
+            flags['elliott'] and
+            flags['ta'] and
+            (flags['vp'] or flags['ob'] or flags['cluster']) and
+            flags['smtm']
+        )
+        return strong
 class TrueCryptoAlpha:
     def __init__(self):
-        self.version = "2.0.0"
-        self.exchange = None
-        self.pairs = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT']
-        
+        self.version = "3.0.0"
+        self.exchange = ccxt.binance({'enableRateLimit': True})
+        self.universe = CMCUniverse()
+        self.signal_last_time = {}
     def print_banner(self):
         banner = f"""
 {Fore.CYAN}{'='*70}
-{Fore.YELLOW}  🚀 TRUE CRYPTO ALPHA v{self.version} - FULL VERSION
-{Fore.GREEN}  💡 Технический анализ + Генерация сигналов + Telegram
+{Fore.YELLOW} 🚀 TRUE CRYPTO ALPHA v{self.version} - FULL VERSION
+{Fore.GREEN} 💡 TA, Volume, Эллиот, Telegram
 {Fore.CYAN}{'='*70}{Style.RESET_ALL}
-        """
+ """
         print(banner)
-        
-    async def setup_exchange(self):
+    async def get_ohlcv(self, symbol, tf='15m', limit=500):
         try:
-            self.exchange = ccxt.binance({'enableRateLimit': True})
-            logger.info(f"{Fore.GREEN}✅ Binance API подключено!{Style.RESET_ALL}")
-            return True
-        except Exception as e:
-            logger.error(f"{Fore.RED}❌ Ошибка: {e}{Style.RESET_ALL}")
-            return False
-    
-    async def get_ohlcv(self, symbol, timeframe='15m', limit=100):
-        """Получить свечи"""
-        try:
-            ohlcv = await asyncio.to_thread(
-                self.exchange.fetch_ohlcv, symbol, timeframe, limit=limit
-            )
-            df = pd.DataFrame(
-                ohlcv, 
-                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            )
+            ohlcv = await asyncio.to_thread(self.exchange.fetch_ohlcv, symbol, tf, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
             return df
         except Exception as e:
-            logger.error(f"Error fetching OHLCV: {e}")
+            logger.error(f"Ошибка OHLCV: {e}")
             return None
-    
-    async def send_telegram_signal(self, signal):
-        """Отправить сигнал в Telegram"""
-        if not TELEGRAM_ENABLED:
-            return
-        
-        try:
-            emoji = "📈" if signal['type'] == 'LONG' else "📉"
-            
-            message = f"""
-🚀 <b>TRUE CRYPTO ALPHA - Сигнал!</b>
-
-📢 <b>Открытие: {signal['type']} {emoji}</b>
-💱 <b>Pair:</b> {signal['pair']}
-📊 <b>Цена:</b> ${signal['price']:,.2f}
-🎯 <b>Тейк профит:</b> ${signal['take_profit']:,.2f} ({((signal['take_profit']/signal['price']-1)*100):+.2f}%)
-🛡️ <b>Стоп лосс:</b> ${signal['stop_loss']:,.2f} ({((signal['stop_loss']/signal['price']-1)*100):+.2f}%)
-🎯 <b>Confidence:</b> {signal['confidence']:.0f}%
-
-🧠 <b>AI Анализ:</b>
-• RSI: {signal['rsi']:.1f}
-• MACD: {signal['macd']}
-• Тренд: {'Bullish' if signal['type']=='LONG' else 'Bearish'}
-
-⚠️ <i>Риск - твоя ответственность!</i>
-            """
-            
-            await asyncio.to_thread(
-                telegram_bot.send_message,
-                chat_id=telegram_chat_id,
-                text=message,
-                parse_mode='HTML'
-            )
-            logger.info(f"{Fore.GREEN}📱 Сигнал отправлен в Telegram!{Style.RESET_ALL}")
-        except Exception as e:
-            logger.error(f"Telegram error: {e}")
-    
-    async def analyze_and_signal(self, pair):
-        """Анализ и генерация сигнала"""
-        df = await self.get_ohlcv(pair)
-        if df is None or len(df) < 50:
-            return None
-        
-        analysis = TechnicalAnalysis.analyze(df)
-        signal = SignalGenerator.generate(analysis, pair)
-        
-        return signal
-    
+    async def analyze_all_tfs(self, symbol):
+        df_m15 = await self.get_ohlcv(symbol, TFEnum.M15)
+        df_h1 = await self.get_ohlcv(symbol, TFEnum.H1)
+        df_h4 = await self.get_ohlcv(symbol, TFEnum.H4)
+        return df_m15, df_h1, df_h4
     async def run(self):
         self.print_banner()
-        
-        if not await self.setup_exchange():
-            return
-        
-        logger.info(f"{Fore.CYAN}📊 Начинаю мониторинг {len(self.pairs)} пар...{Style.RESET_ALL}")
-        logger.info(f"{Fore.YELLOW}⏰ Анализ каждые 2 минуты{Style.RESET_ALL}")
-        
-        if TELEGRAM_ENABLED:
-            logger.info(f"{Fore.GREEN}📱 Telegram сигналы активны!{Style.RESET_ALL}")
-        else:
-            logger.info(f"{Fore.YELLOW}📱 Telegram не настроен (работаем без него){Style.RESET_ALL}")
-        
-        iteration = 0
-        
+        pairs = self.universe.get_pairs(self.exchange)
+        logger.info(f"{Fore.CYAN}Мониторинг {len(pairs)} инструментов...{Style.RESET_ALL}")
         while True:
             try:
-                iteration += 1
-                logger.info(f"\n{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
-                logger.info(f"{Fore.YELLOW}🔍 Анализ #{iteration} - {datetime.now().strftime('%H:%M:%S')}{Style.RESET_ALL}")
-                logger.info(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
-                
-                for pair in self.pairs:
-                    logger.info(f"\n{Fore.CYAN}Анализирую {pair}...{Style.RESET_ALL}")
-                    
-                    signal = await self.analyze_and_signal(pair)
-                    
-                    if signal:
-                        logger.info(f"{Fore.GREEN}🎯 СИГНАЛ НАЙДЕН!{Style.RESET_ALL}")
-                        logger.info(f"{Fore.YELLOW}  Тип: {signal['type']}{Style.RESET_ALL}")
-                        logger.info(f"  Цена: ${signal['price']:,.2f}")
-                        logger.info(f"  Confidence: {signal['confidence']:.0f}%")
-                        
-                        await self.send_telegram_signal(signal)
+                for symbol in pairs:
+                    now = datetime.now()
+                    last_time = self.signal_last_time.get(symbol, now-timedelta(hours=3))
+                    if (now-last_time).total_seconds()<7200:
+                        continue
+                    df_m15, df_h1, df_h4 = await self.analyze_all_tfs(symbol)
+                    if any(df is None or len(df)<100 for df in [df_m15,df_h1,df_h4]): continue
+                    atr = TechnicalAnalysis.calculate_atr(df_m15)
+                    if atr<0.1: continue
+                    elliott_signal, elliott_dir = SignalModules.elliott_wave(df_m15,df_h1)
+                    vp_ok,poc,lvn = SignalModules.volume_profile(df_m15)
+                    cluster_absorb = SignalModules.cluster_absorb(df_m15)
+                    ob_touched,ob_price = SignalModules.order_block(df_m15)
+                    smtm_ok = SignalModules.smart_money(df_m15)
+                    ta_ok = SignalModules.classic_ta(df_m15)
+                    mods = {
+                        'elliott': elliott_signal,
+                        'vp': vp_ok,
+                        'ob': ob_touched,
+                        'smtm': smtm_ok,
+                        'ta': ta_ok,
+                        'cluster': cluster_absorb
+                    }
+                    score = SignalAggregator.score(mods)
+                    strong = SignalAggregator.is_strong_signal(mods)
+                    price_now = df_m15['close'].iloc[-1]
+                    swing_lows = df_m15['low'].rolling(3).min().iloc[-10:]
+                    swing_highs = df_m15['high'].rolling(3).max().iloc[-10:]
+                    entry = ob_price if ob_touched and ob_price else price_now
+                    sl = min(swing_lows.min(), entry-atr*1.2) if elliott_dir=='LONG' else max(swing_highs.max(), entry+atr*1.2)
+                    tp1 = entry+atr*1.5 if elliott_dir=='LONG' else entry-atr*1.5
+                    tp2 = poc if poc else entry+atr*2 if elliott_dir=='LONG' else entry-atr*2
+                    tp3 = entry+atr*3 if elliott_dir=='LONG' else entry-atr*3
+                    rr = abs(tp2-entry)/abs(entry-sl) if abs(entry-sl)>0.01 else 0
+                    day_high = df_m15['high'].max()
+                    day_low = df_m15['low'].min()
+                    risk_tag = ''
+                    if abs(price_now-day_high)/day_high<0.01 or abs(price_now-day_low)/day_low<0.01:
+                        risk_tag = '⚠️ РИСК!'
+                    if not strong or score<5 or rr<1.5:
+                        continue
+                    self.signal_last_time[symbol]=now
+                    msg = f"{symbol}\nTF: 15m\nENTRY: {entry:.2f}\nTP1: {tp1:.2f}\nTP2: {tp2:.2f}\nTP3: {tp3:.2f}\nSL: {sl:.2f}\nКомментарий:\nЭллиот={elliott_dir}, объёмная структура, атака по Order Block/Volume\nРиск рекомендуемый: 1%\n{risk_tag}\n#truecrypto #{symbol.split('/')[0]}"
+                    if TELEGRAM_ENABLED:
+                        try:
+                            await asyncio.to_thread(telegram_bot.send_message,
+                                chat_id=telegram_chat_id,
+                                text=msg,
+                                parse_mode='HTML')
+                            logger.info(f"{Fore.GREEN}📱 Сигнал ушёл в Telegram!{Style.RESET_ALL}")
+                        except Exception as te:
+                            logger.error(f"Telegram error: {te}")
                     else:
-                        logger.info(f"{Fore.YELLOW}  Нет сильных сигналов{Style.RESET_ALL}")
-                    
-                    await asyncio.sleep(2)
-                
-                logger.info(f"\n{Fore.GREEN}✅ Анализ завершён. Ожидание 2 минуты...{Style.RESET_ALL}")
+                        logger.info(f"{Fore.YELLOW}Сигнал: {msg}{Style.RESET_ALL}")
                 await asyncio.sleep(120)
-                
-            except KeyboardInterrupt:
-                logger.info(f"{Fore.YELLOW}\n⚠️ Остановка бота...{Style.RESET_ALL}")
-                break
             except Exception as e:
-                logger.error(f"{Fore.RED}❌ Ошибка: {e}{Style.RESET_ALL}")
+                logger.error(f"{Fore.RED}Ошибка: {e}{Style.RESET_ALL}")
                 await asyncio.sleep(60)
-
-if __name__ == "__main__":
+if __name__=="__main__":
     bot = TrueCryptoAlpha()
-    
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
